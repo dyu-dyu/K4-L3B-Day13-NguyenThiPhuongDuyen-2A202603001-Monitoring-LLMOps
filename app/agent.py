@@ -51,7 +51,34 @@ class LabAgent:
             },
         ):
             started = time.perf_counter()
-            docs = retrieve(message)
+            start_observation = getattr(
+                langfuse_client, "start_as_current_observation", None
+            )
+            if callable(start_observation):
+                with start_observation(
+                    name="retrieval",
+                    as_type="retriever",
+                    input={"query_preview": summarize_text(message)},
+                    metadata={
+                        "correlation_id": correlation_id,
+                        "tool_name": "retrieval",
+                    },
+                ) as retrieval_observation:
+                    docs = retrieve(message)
+                    retrieval_observation.update(
+                        output={
+                            "doc_count": len(docs),
+                            "docs_preview": [summarize_text(doc) for doc in docs],
+                        },
+                        metadata={
+                            "correlation_id": correlation_id,
+                            "tool_name": "retrieval",
+                            "tool_success": True,
+                            "doc_count": len(docs),
+                        },
+                    )
+            else:
+                docs = retrieve(message)
             prompt = resolve_prompt(
                 langfuse_client,
                 feature=feature,
@@ -74,7 +101,46 @@ class LabAgent:
             # TODO (CP2): instrument retrieve() and FakeLLM.generate() as child
             # observations. The nested generation must receive prompt, usage and cost.
             with propagate_attributes(prompt=prompt.managed_prompt):
-                response = self.llm.generate(prompt.text)
+                if callable(start_observation):
+                    with start_observation(
+                        name="generation",
+                        as_type="generation",
+                        model=self.model,
+                        prompt=prompt.managed_prompt,
+                        input={"prompt_preview": summarize_text(prompt.text)},
+                        metadata={
+                            "correlation_id": correlation_id,
+                            "prompt_name": prompt.name,
+                            "prompt_label": prompt.label,
+                            "prompt_version": prompt.version,
+                            "prompt_source": prompt.source,
+                        },
+                    ) as generation_observation:
+                        response = self.llm.generate(prompt.text)
+                        generation_cost_usd = self._estimate_cost(
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
+                        )
+                        generation_observation.update(
+                            output={
+                                "answer_preview": summarize_text(response.text)
+                            },
+                            usage_details={
+                                "input": response.usage.input_tokens,
+                                "output": response.usage.output_tokens,
+                            },
+                            cost_details={"total": generation_cost_usd},
+                            metadata={
+                                "correlation_id": correlation_id,
+                                "ttft_ms": response.ttft_ms,
+                                "prompt_name": prompt.name,
+                                "prompt_label": prompt.label,
+                                "prompt_version": prompt.version,
+                                "prompt_source": prompt.source,
+                            },
+                        )
+                else:
+                    response = self.llm.generate(prompt.text)
             quality_score = self._heuristic_quality(message, response.text, docs)
             latency_ms = int((time.perf_counter() - started) * 1000)
             cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
